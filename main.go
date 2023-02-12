@@ -17,9 +17,46 @@ import (
 	"k8s.io/client-go/rest"
 )
 
-func getFluentdIPs(namespace string, clientset *kubernetes.Clientset) ([]string, error) {
-	pods, err := clientset.CoreV1().Pods(namespace).List(context.Background(), metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("app=%s", namespace),
+type app struct {
+	namespace string
+	certName  string
+	client    *kubernetes.Clientset
+}
+
+type config struct {
+	serviceURL string
+	certName   string
+	namespace  string
+}
+
+func getConfig() config {
+	serviceURL, ok := os.LookupEnv("FLUENTD_SERVICE_URL")
+	if !ok {
+		panic("FLUENTD_SERVICE_URL is not set")
+	}
+
+	certName, ok := os.LookupEnv("FLUENTD_CERT_NAME")
+	if !ok {
+		panic("FLUENTD_CERT_NAME is not set")
+	}
+
+	namespace, ok := os.LookupEnv("FLUENTD_NAMESPACE")
+	if !ok {
+		panic("FLUENTD_NAMESPACE is not set")
+	}
+
+	return config{
+		serviceURL: serviceURL,
+		certName:   certName,
+		namespace:  namespace,
+	}
+}
+
+// get all pods with label app=fluentd in the configured namespace
+// note that this will only work if the pods are created by a statefulset
+func (a app) getFluentdIPs() ([]string, error) {
+	pods, err := a.client.CoreV1().Pods(a.namespace).List(context.Background(), metav1.ListOptions{
+		LabelSelector: fmt.Sprintf("app=%s", a.namespace),
 	})
 
 	if err != nil {
@@ -37,6 +74,25 @@ func getFluentdIPs(namespace string, clientset *kubernetes.Clientset) ([]string,
 	}
 
 	return fluentdIPs, nil
+}
+
+func (a app) getCRD() (cmapi.Certificate, error) {
+	certificates := cmapi.CertificateList{}
+	uri := fmt.Sprintf("/apis/cert-manager.io/v1/namespaces/%s/certificates", a.namespace)
+	err := a.client.RESTClient().Get().RequestURI(uri).Do(context.Background()).Into(&certificates)
+	if err != nil {
+		return cmapi.Certificate{}, fmt.Errorf("failed to get certificates: %w", err)
+	}
+
+	for _, cert := range certificates.Items {
+		if strings.EqualFold(cert.Name, a.certName) {
+			return cert, nil
+		}
+
+		log.Printf("Certificate %s is not fluentd cerificate", cert.Name)
+	}
+
+	return cmapi.Certificate{}, fmt.Errorf("failed to find fluentd certificate")
 }
 
 func checkCert(serviceURL string) (time.Time, error) {
@@ -74,7 +130,6 @@ func reloadFluentdConfig(ips ...string) error {
 		}
 		defer resp.Body.Close()
 
-		// check response
 		if resp.StatusCode >= 400 {
 			return fmt.Errorf("failed to reload fluentd config: %s", resp.Status)
 		}
@@ -91,66 +146,52 @@ func reloadFluentdConfig(ips ...string) error {
 }
 
 func main() {
-	config, err := rest.InClusterConfig()
+	// setup kubernetes client with default config
+	// works both locally if you have kubectl correctly configured and in cluster
+	cfg, err := rest.InClusterConfig()
+	if err != nil {
+		panic(err)
+	}
+	clientset, err := kubernetes.NewForConfig(cfg)
 	if err != nil {
 		panic(err)
 	}
 
-	clientset, err := kubernetes.NewForConfig(config)
-	if err != nil {
-		panic(err)
-	}
-	namespace, ok := os.LookupEnv("FLUENTD_NAMESPACE")
-	if !ok {
-		panic("FLUENTD_NAMESPACE is not set")
-	}
-	serviceURL, ok := os.LookupEnv("FLUENTD_SERVICE_URL")
-	if !ok {
-		panic("FLUENTD_SERVICE_ENDPOINT is not set")
+	config := getConfig()
+	app := app{
+		namespace: config.namespace,
+		certName:  config.certName,
+		client:    clientset,
 	}
 
-	fluentdIPs, err := getFluentdIPs(namespace, clientset)
+	fluentdIPs, err := app.getFluentdIPs()
 	if err != nil {
 		panic(err)
 	}
 
-	certificates := cmapi.CertificateList{}
-	uri := fmt.Sprintf("/apis/cert-manager.io/v1/namespaces/%s/certificates", namespace)
-	err = clientset.RESTClient().Get().RequestURI(uri).Do(context.Background()).Into(&certificates)
+	expiry, err := checkCert(config.serviceURL)
 	if err != nil {
 		panic(err)
 	}
 
-	for _, cert := range certificates.Items {
-		// cert.Status.NotAfter = When the certificate will expire
-		// cert.Status.NotBefore = When the certificate was issued
-		// cert.Status.RenewalTime = When the certificate will be renewed
+	certificate, err := app.getCRD()
+	if err != nil {
+		panic(err)
+	}
 
-		if !strings.Contains(strings.ToLower(cert.Name), namespace) {
-			log.Printf("Certificate %s is not fluentd cerificate", cert.Name)
-			continue
-		}
+	log.Printf("Certificate will expire on %v\n", expiry)
+	t := metav1.NewTime(expiry)
+	if certificate.Status.NotAfter.Equal(&t) {
+		log.Printf("Certificate will be renewed on %v\n", certificate.Status.RenewalTime)
+		log.Println("Certificate is valid")
 
-		log.Printf("Found certificate %s\n", cert.Name)
-		expiry, err := checkCert(serviceURL)
-		if err != nil {
-			panic(err)
-		}
+		return
+	}
 
-		log.Printf("Certificate will expire on %v\n", expiry)
-		t := metav1.NewTime(expiry)
-		if cert.Status.NotAfter.Equal(&t) {
-			log.Printf("Certificate will be renewed on %v\n", cert.Status.RenewalTime)
-			log.Println("Certificate is valid")
-
-			continue
-		}
-
-		log.Println("Certificate is not valid")
-		log.Printf("Certificate should expire on %v but it expires on %v\n", cert.Status.NotAfter, expiry)
-		err = reloadFluentdConfig(fluentdIPs...)
-		if err != nil {
-			panic(err)
-		}
+	log.Println("Certificate is not valid")
+	log.Printf("Certificate should expire on %v but it expires on %v\n", certificate.Status.NotAfter, expiry)
+	err = reloadFluentdConfig(fluentdIPs...)
+	if err != nil {
+		panic(err)
 	}
 }
