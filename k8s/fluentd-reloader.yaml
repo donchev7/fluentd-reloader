@@ -49,3 +49,5 @@ spec:
                   value: "logging"
                 - name: FLUENTD_SERVICE_URL
                   value: "logging.donchev.is"
+                - name: FLUENTD_CERT_NAME
+                  value: "fluentd-tls"
